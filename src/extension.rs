@@ -2,7 +2,8 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use tokio::time::timeout;
@@ -244,7 +245,7 @@ impl ExtensionClient {
         
         // Only process one batch at a time to avoid blocking
         let batch = {
-            let mut guard = aggregator.lock().expect("lock poisoned");
+            let mut guard = aggregator.lock().await;
             guard.get_batch()
         };
         
@@ -409,7 +410,7 @@ impl ExtensionClient {
         loop {
             // Get next batch from aggregator
             let batch = {
-                let mut guard = aggregator.lock().expect("lock poisoned");
+                let mut guard = aggregator.lock().await;
                 guard.get_batch()
             };
             

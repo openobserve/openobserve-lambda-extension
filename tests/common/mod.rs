@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use serde_json::Value;

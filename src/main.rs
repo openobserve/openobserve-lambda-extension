@@ -121,7 +121,7 @@ async fn run_extension(config: Arc<Config>, metrics: &mut ExtensionMetrics) -> R
     // Set up telemetry components
     
     // Create aggregator
-    let aggregator = Arc::new(std::sync::Mutex::new(
+    let aggregator = Arc::new(tokio::sync::Mutex::new(
         telemetry::TelemetryAggregator::new(
             config.max_buffer_size_bytes(),
             100, // max batch entries

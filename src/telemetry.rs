@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,7 +248,7 @@ async fn process_telemetry_batch(
     
     // Add events directly to aggregator
     {
-        let mut aggregator_guard = aggregator.lock().expect("lock poisoned");
+        let mut aggregator_guard = aggregator.lock().await;
         aggregator_guard.add_batch(telemetry_events);
     }
     
