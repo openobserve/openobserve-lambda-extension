@@ -121,10 +121,12 @@ async fn run_extension(config: Arc<Config>, metrics: &mut ExtensionMetrics) -> R
     // Set up telemetry components
     
     // Create aggregator
+    let function_name = env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or_else(|_| "unknown".to_string());
     let aggregator = Arc::new(tokio::sync::Mutex::new(
         telemetry::TelemetryAggregator::new(
             config.max_buffer_size_bytes(),
             100, // max batch entries
+            function_name,
         )
     ));
 

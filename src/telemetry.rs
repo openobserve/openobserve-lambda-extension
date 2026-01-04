@@ -26,15 +26,17 @@ pub struct TelemetryAggregator {
     buffer: Vec<u8>,
     max_content_size_bytes: usize,
     max_batch_entries_size: usize,
+    function_name: String,
 }
 
 impl TelemetryAggregator {
-    pub fn new(max_content_size_bytes: usize, max_batch_entries_size: usize) -> Self {
+    pub fn new(max_content_size_bytes: usize, max_batch_entries_size: usize, function_name: String) -> Self {
         Self {
             messages: VecDeque::new(),
             buffer: Vec::with_capacity(max_content_size_bytes),
             max_content_size_bytes,
             max_batch_entries_size,
+            function_name,
         }
     }
 
@@ -45,7 +47,8 @@ impl TelemetryAggregator {
             let mut event_json = serde_json::json!({
                 "_timestamp": event.time.timestamp_micros(),
                 "record": event.record,
-                "type": event.event_type
+                "type": event.event_type,
+                "function_name": self.function_name
             });
             
             // Add requestId if present
@@ -261,7 +264,7 @@ mod tests {
     
     #[test]
     fn test_telemetry_aggregator() {
-        let mut aggregator = TelemetryAggregator::new(1024, 10);
+        let mut aggregator = TelemetryAggregator::new(1024, 10, "test-function".to_string());
         
         let events = vec![
             TelemetryEvent {
