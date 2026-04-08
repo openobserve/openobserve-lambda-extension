@@ -131,13 +131,54 @@ impl Config {
     }
     
     pub fn openobserve_url(&self) -> String {
-        format!("{}/api/{}/{}/_json", 
-            self.o2_endpoint, 
-            self.o2_organization_id, 
+        format!("{}/api/{}/{}/_json",
+            self.o2_endpoint,
+            self.o2_organization_id,
             self.o2_stream
         )
     }
-    
+
+    /// OTLP traces endpoint — uses OTEL_EXPORTER_OTLP_ENDPOINT if set,
+    /// otherwise constructs from O2_* vars.
+    pub fn traces_url(&self) -> String {
+        let base = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .map(|e| e.trim_end_matches('/').to_string())
+            .unwrap_or_else(|_| format!("{}/api/{}", self.o2_endpoint.trim_end_matches('/'), self.o2_organization_id));
+        format!("{}/v1/traces", base)
+    }
+
+    /// Authorization header value — prefers OTEL_EXPORTER_OTLP_HEADERS, falls back to O2_AUTHORIZATION_HEADER.
+    pub fn effective_auth_header(&self) -> String {
+        if let Ok(headers) = std::env::var("OTEL_EXPORTER_OTLP_HEADERS") {
+            for entry in headers.split(',') {
+                let entry = entry.trim();
+                if let Some(pos) = entry.find('=') {
+                    let k = entry[..pos].trim().to_lowercase();
+                    let v = entry[pos + 1..].trim().to_string();
+                    if k == "authorization" {
+                        return v;
+                    }
+                }
+            }
+        }
+        self.o2_authorization_header.clone()
+    }
+
+    /// Parse OTEL_EXPORTER_OTLP_HEADERS into (name, value) pairs.
+    pub fn parsed_otlp_headers(&self) -> Vec<(String, String)> {
+        let Ok(raw) = std::env::var("OTEL_EXPORTER_OTLP_HEADERS") else {
+            return vec![];
+        };
+        raw.split(',')
+            .filter_map(|entry| {
+                let entry = entry.trim();
+                entry.find('=').map(|pos| {
+                    (entry[..pos].trim().to_string(), entry[pos + 1..].trim().to_string())
+                })
+            })
+            .collect()
+    }
+
     pub fn max_buffer_size_bytes(&self) -> usize {
         self.max_buffer_size_mb * 1024 * 1024
     }

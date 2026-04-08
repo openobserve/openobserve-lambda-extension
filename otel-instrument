@@ -1,0 +1,23 @@
+#!/bin/bash
+# OpenObserve Lambda OTel bootstrap
+# Used as AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument
+
+OTEL_PKG="/opt/nodejs/node_modules/@opentelemetry/auto-instrumentations-node/build/src/register.js"
+
+# Point the OTel SDK at the OTLP receiver inside this extension (localhost:4318)
+# Only sets defaults — existing env vars (e.g. set in Lambda console) take precedence
+export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}"
+export OTEL_EXPORTER_OTLP_PROTOCOL="${OTEL_EXPORTER_OTLP_PROTOCOL:-http/json}"
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-http://localhost:4318/v1/traces}"
+export OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-${AWS_LAMBDA_FUNCTION_NAME:-lambda-function}}"
+export OTEL_LOGS_EXPORTER="${OTEL_LOGS_EXPORTER:-none}"
+export OTEL_METRICS_EXPORTER="${OTEL_METRICS_EXPORTER:-none}"
+export OTEL_TRACES_EXPORTER="${OTEL_TRACES_EXPORTER:-otlp}"
+
+# Preload auto-instrumentation only if the package is present in the layer
+if [ -f "$OTEL_PKG" ]; then
+    export NODE_OPTIONS="--require $OTEL_PKG${NODE_OPTIONS:+ $NODE_OPTIONS}"
+fi
+
+# Hand off to the real Lambda bootstrap
+exec "$@"

@@ -10,6 +10,7 @@ use tokio::time::timeout;
 
 use crate::telemetry::TelemetryAggregator;
 use crate::config::Config;
+use crate::otlp_receiver::{SpanBuffer, flush_spans};
 
 const LAMBDA_EXTENSION_IDENTIFIER_HEADER: &str = "Lambda-Extension-Identifier";
 const LAMBDA_EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
@@ -68,6 +69,7 @@ pub struct ExtensionClient {
     recent_invocations: VecDeque<Instant>,
     aggregator: Option<Arc<Mutex<TelemetryAggregator>>>,
     config: Option<Arc<Config>>,
+    span_buffer: Option<SpanBuffer>,
     pub current_strategy: FlushingStrategy,
     last_periodic_flush: Instant,
     continuous_flush_task: Option<tokio::task::JoinHandle<()>>,
@@ -89,6 +91,7 @@ impl ExtensionClient {
             recent_invocations: VecDeque::new(),
             aggregator: None,
             config: None,
+            span_buffer: None,
             current_strategy: FlushingStrategy::EndOfInvocation, // Start with safe default
             last_periodic_flush: now,
             continuous_flush_task: None,
@@ -99,9 +102,11 @@ impl ExtensionClient {
         &mut self,
         aggregator: Arc<Mutex<TelemetryAggregator>>,
         config: Arc<Config>,
+        span_buffer: SpanBuffer,
     ) {
         self.aggregator = Some(aggregator);
         self.config = Some(config);
+        self.span_buffer = Some(span_buffer);
     }
 
     /// Determine the appropriate flushing strategy based on invocation patterns
@@ -241,33 +246,21 @@ impl ExtensionClient {
         aggregator: &Arc<Mutex<TelemetryAggregator>>,
         config: &Arc<Config>,
     ) -> Result<u64> {
-        let mut total_events = 0;
-        
-        // Only process one batch at a time to avoid blocking
         let batch = {
             let mut guard = aggregator.lock().await;
             guard.get_batch()
         };
-        
-        if !batch.is_empty() {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_millis(1000)) // 1 second timeout for async
-                .build()
-                .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
-            
-            match crate::openobserve::send_batch_to_openobserve(&client, config, &batch).await {
-                Ok(events_sent) => {
-                    total_events += events_sent;
-                    debug!("✅ Async flush: {} events sent", events_sent);
-                },
-                Err(e) => {
-                    warn!("❌ Async flush failed: {}", e);
-                    return Err(e);
-                }
-            }
+        if batch.is_empty() { return Ok(0); }
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(1000))
+            .build()
+            .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
+
+        match crate::openobserve::send_batch_to_openobserve(&client, config, &batch).await {
+            Ok(n) => { debug!("✅ Async flush: {} events", n); Ok(n) }
+            Err(e) => { warn!("❌ Async flush failed: {}", e); Err(e) }
         }
-        
-        Ok(total_events)
     }
     
     pub async fn register(&mut self) -> Result<RegisterResponse> {
@@ -397,54 +390,34 @@ impl ExtensionClient {
         config: &Arc<Config>,
     ) -> Result<u64> {
         let mut total_events = 0;
-        let url = config.openobserve_url();
-        
-        debug!("🌐 Starting synchronous flush to {}", url);
-        
-        // Create HTTP client with timeout
+
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(1900)) // 1.9 seconds max
+            .timeout(std::time::Duration::from_millis(1900))
             .build()
             .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
-        
+
+        // Flush logs
         loop {
-            // Get next batch from aggregator
             let batch = {
                 let mut guard = aggregator.lock().await;
                 guard.get_batch()
             };
-            
-            // If no more batches, we're done
-            if batch.is_empty() {
-                break;
-            }
-            
-            // debug!("📦 Sending batch of {} bytes", batch.len());
-            
-            // Count events in this batch
-            let _events_in_batch = if let Ok(batch_str) = String::from_utf8(batch.clone()) {
-                if batch_str.trim().starts_with('[') && batch_str.trim().ends_with(']') {
-                    batch_str.matches(',').count() as u64 + 1
-                } else {
-                    1
-                }
-            } else {
-                1
-            };
-            
-            // Use the shared HTTP function
+            if batch.is_empty() { break; }
             match crate::openobserve::send_batch_to_openobserve(&client, config, &batch).await {
-                Ok(events_sent) => {
-                    total_events += events_sent;
-                }
-                Err(e) => {
-                    debug!("❌ Batch failed: {}", e);
-                    return Err(e);
-                }
+                Ok(n) => total_events += n,
+                Err(e) => { debug!("❌ Log batch failed: {}", e); return Err(e); }
             }
         }
-        
-        debug!("🎉 Synchronous flush completed: {} total events sent", total_events);
+
+        // Flush spans (if OTLP receiver is enabled)
+        if let Some(span_buf) = &self.span_buffer {
+            match flush_spans(&client, config, span_buf).await {
+                Ok(n) => { total_events += n; debug!("🔍 Flushed {} span batches", n); }
+                Err(e) => debug!("⚠️ Span flush failed: {}", e),
+            }
+        }
+
+        debug!("🎉 Flush completed: {} total events sent", total_events);
         Ok(total_events)
     }
     

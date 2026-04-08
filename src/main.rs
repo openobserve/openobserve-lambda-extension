@@ -8,15 +8,18 @@ use tracing_subscriber::{EnvFilter, fmt::format::Writer, fmt::FormatEvent, fmt::
 
 mod config;
 mod extension;
+mod otlp_receiver;
 mod telemetry;
 mod openobserve;
 
 use config::Config;
 use extension::{ExtensionClient, NextEventResponse, FlushingStrategy};
-use telemetry::{TelemetrySubscriber};
+use otlp_receiver::OtlpReceiver;
+use telemetry::TelemetrySubscriber;
 
 const EXTENSION_NAME: &str = "o2-lambda-extension";
 const TELEMETRY_SUBSCRIBER_PORT: u16 = 8080;
+const OTLP_RECEIVER_PORT: u16 = 4318;
 
 struct ExtensionMetrics {
     start_time: Instant,
@@ -118,32 +121,28 @@ async fn run_extension(config: Arc<Config>, metrics: &mut ExtensionMetrics) -> R
 
     let extension_id = registration.extension_id.clone();
 
-    // Set up telemetry components
-    
-    // Create aggregator
+    // Create log aggregator
     let aggregator = Arc::new(tokio::sync::Mutex::new(
         telemetry::TelemetryAggregator::new(
             config.max_buffer_size_bytes(),
-            100, // max batch entries
+            100,
         )
     ));
 
-    // Set up telemetry subscriber
+    // Start telemetry subscriber (logs via Lambda Telemetry API)
     let mut telemetry_subscriber = TelemetrySubscriber::new(TELEMETRY_SUBSCRIBER_PORT, Arc::clone(&aggregator));
-    
     telemetry_subscriber.start().await?;
-    
     telemetry_subscriber.subscribe_to_telemetry_api(&extension_id).await?;
 
-    // Note: Using Telemetry API to capture logs, metrics, and traces
-    // AWS Lambda allows only one subscription per extension
-    
-    // Note: No async OpenObserve client needed - using synchronous flush in extension.rs
-    
-    // Set telemetry components in extension client for SHUTDOWN handling
+    // Start OTLP receiver (traces from OTel SDK via AWS_LAMBDA_EXEC_WRAPPER)
+    let (mut otlp_receiver, span_buffer) = OtlpReceiver::new(OTLP_RECEIVER_PORT);
+    otlp_receiver.start().await?;
+
+    // Set telemetry components in extension client for flush + SHUTDOWN handling
     extension_client.set_telemetry_components(
         Arc::clone(&aggregator),
         Arc::clone(&config),
+        span_buffer,
     );
 
     // Main extension lifecycle loop - SHUTDOWN flush now happens in extension.rs
@@ -157,6 +156,7 @@ async fn run_extension(config: Arc<Config>, metrics: &mut ExtensionMetrics) -> R
     
     // Stop accepting new telemetry requests
     telemetry_subscriber.shutdown().await;
+    otlp_receiver.shutdown().await;
     
     // Give time for final processing
     tokio::time::sleep(Duration::from_millis(200)).await;
