@@ -1,26 +1,27 @@
 # OpenObserve Lambda Layer
 
-A high-performance AWS Lambda Extension written in Rust that automatically captures and forwards Lambda function logs to [OpenObserve](https://openobserve.ai) in real-time.
+A high-performance AWS Lambda Extension written in Rust that automatically captures and forwards Lambda function **logs and traces** to [OpenObserve](https://openobserve.ai) in real-time — with a single layer, no ADOT required.
 
 ## 🎯 Overview
 
-This Lambda layer runs as a separate process alongside your Lambda function, capturing all logs and telemetry without impacting your function's performance. It uses AWS Lambda's Extensions API to collect logs and forwards them to OpenObserve as structured JSON.
+This Lambda layer runs as a separate process alongside your Lambda function, capturing all logs via the Lambda Telemetry API and distributed traces via an embedded OTLP receiver. It uses AWS Lambda's Extensions API and forwards everything to OpenObserve.
 
 ### How It Works
 
 ```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Your Lambda   │    │  O2 Extension    │    │   OpenObserve   │
-│   Function      │───▶│  (This Layer)    │───▶│   Platform      │
-│                 │    │                  │    │                 │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        Lambda Function                           │
+│                                                                  │
+│  stdout/stderr ──▶ Telemetry API ──▶ ┌──────────────────────┐  │
+│                                       │   O2 Extension        │  │
+│  OTel SDK ──────▶ localhost:4318 ──▶  │   (This Layer)       │──▶ OpenObserve
+│  (auto-instrumented)                  │   Rust sidecar        │  │
+│                                       └──────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-1. **Extension Registration**: Layer registers with Lambda Extensions API
-2. **Log Subscription**: Subscribes to Lambda Logs API to receive all function logs  
-3. **Smart Buffering**: Collects logs in memory with overflow protection
-4. **Adaptive Flushing**: Uses intelligent strategies based on invocation patterns
-5. **Reliable Delivery**: Implements retry logic with exponential backoff
+- **Logs**: Captured via Lambda Telemetry API → forwarded to OpenObserve `/_json`
+- **Traces**: OTel SDK auto-instruments your code → sends spans to the embedded OTLP receiver on `localhost:4318` → forwarded to OpenObserve `/v1/traces`
 
 ## 🚀 Quick Start
 
@@ -83,7 +84,7 @@ AWS_REGION=eu-west-1 ./deploy.sh
 aws lambda publish-layer-version \
   --layer-name openobserve-extension-x86_64 \
   --zip-file fileb://target/o2-lambda-extension-x86_64.zip \
-  --compatible-runtimes python3.9 python3.10 python3.11 python3.12 python3.13 nodejs18.x nodejs20.x nodejs22.x java11 java17 java21 dotnet6 dotnet8 go1.x ruby3.2 ruby3.3 provided.al2 provided.al2023 \
+  --compatible-runtimes python3.9 python3.10 python3.11 python3.12 python3.13 nodejs18.x nodejs20.x nodejs22.x java11 java17 java21 dotnet8 ruby3.3 provided.al2 provided.al2023 \
   --compatible-architectures x86_64 \
   --description "OpenObserve lambda layer extension for forwarding logs (x86_64)"
 
@@ -91,7 +92,7 @@ aws lambda publish-layer-version \
 aws lambda publish-layer-version \
   --layer-name openobserve-extension-arm64 \
   --zip-file fileb://target/o2-lambda-extension-arm64.zip \
-  --compatible-runtimes python3.9 python3.10 python3.11 python3.12 python3.13 nodejs18.x nodejs20.x nodejs22.x java11 java17 java21 dotnet6 dotnet8 go1.x ruby3.2 ruby3.3 provided.al2 provided.al2023 \
+  --compatible-runtimes python3.9 python3.10 python3.11 python3.12 python3.13 nodejs18.x nodejs20.x nodejs22.x java11 java17 java21 dotnet8 ruby3.3 provided.al2 provided.al2023 \
   --compatible-architectures arm64 \
   --description "OpenObserve lambda layer extension for forwarding logs (arm64)"
 ```
@@ -100,32 +101,65 @@ aws lambda publish-layer-version \
 
 Add the layer to your Lambda function and set these environment variables:
 
-#### Required Variables
-```bash
-O2_ORGANIZATION_ID=your_organization_id
-O2_AUTHORIZATION_HEADER="Basic your_base64_encoded_credentials"
-```
+#### Logs only (all runtimes)
 
-#### Optional Variables (with defaults)
-```bash
-O2_ENDPOINT=https://api.openobserve.ai    # OpenObserve API endpoint
-O2_STREAM=default                         # Log stream name
-```
+| Variable | Value |
+|---|---|
+| `O2_ORGANIZATION_ID` | Your OpenObserve org ID |
+| `O2_AUTHORIZATION_HEADER` | `Basic <base64-credentials>` |
+| `O2_ENDPOINT` | `https://api.openobserve.ai` |
+| `O2_STREAM` | `lambda_logs` |
+
+#### Logs + Traces (Node.js)
+
+Add all the above **plus**:
+
+| Variable | Value | Description |
+|---|---|---|
+| `AWS_LAMBDA_EXEC_WRAPPER` | `/opt/otel-instrument` | Enables OTel auto-instrumentation |
+| `OTEL_SERVICE_NAME` | your function name | Identifies your service in traces |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `https://api.openobserve.ai/api/<org-id>` | Base OTLP endpoint |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `https://api.openobserve.ai/api/<org-id>/v1/traces` | Traces endpoint |
+| `OTEL_EXPORTER_OTLP_HEADERS` | `Authorization=Basic <base64-credentials>` | Auth header for OTLP export |
+| `OTEL_TRACES_EXPORTER` | `otlp` | Use OTLP exporter |
+| `OTEL_TRACES_SAMPLER` | `always_on` | Sample all traces |
+| `OTEL_BSP_SCHEDULE_DELAY` | `1` | Flush spans after 1ms (critical for Lambda) |
+| `OTEL_BSP_EXPORT_TIMEOUT` | `500` | Span export timeout in ms |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | `500` | OTLP request timeout in ms |
+
+> **Note**: `OTEL_BSP_SCHEDULE_DELAY=1` is critical. Without it the default 5000ms batch delay causes spans to be lost when Lambda freezes the process after the handler returns.
 
 ### 4. Deploy Your Function
 
-That's it! Your Lambda function will now automatically forward all logs to OpenObserve.
+That's it! Your Lambda function will now automatically forward all logs and traces to OpenObserve.
 
 ## ⚙️ Configuration
 
 ### Environment Variables
 
+#### Extension (Logs)
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `O2_ENDPOINT` | No | `https://api.openobserve.ai` | OpenObserve API endpoint URL |
 | `O2_ORGANIZATION_ID` | **Yes** | - | Your OpenObserve organization ID |
+| `O2_AUTHORIZATION_HEADER` | **Yes** | - | Auth header value (e.g., `"Basic <base64>"`) |
+| `O2_ENDPOINT` | No | `https://api.openobserve.ai` | OpenObserve API endpoint URL |
 | `O2_STREAM` | No | `default` | Target log stream name |
-| `O2_AUTHORIZATION_HEADER` | **Yes** | - | Authorization header (e.g., `"Basic <base64>"`) |
+
+#### OTel SDK (Traces — Node.js only)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `AWS_LAMBDA_EXEC_WRAPPER` | **Yes** | - | Set to `/opt/otel-instrument` to enable auto-instrumentation |
+| `OTEL_SERVICE_NAME` | **Yes** | - | Service name shown in traces |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | **Yes** | - | `https://api.openobserve.ai/api/<org-id>` |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | **Yes** | - | `https://api.openobserve.ai/api/<org-id>/v1/traces` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | **Yes** | - | `Authorization=Basic <base64-credentials>` |
+| `OTEL_TRACES_EXPORTER` | No | `otlp` | Exporter type |
+| `OTEL_TRACES_SAMPLER` | No | `always_on` | Sampling strategy |
+| `OTEL_BSP_SCHEDULE_DELAY` | No | `1` | Batch processor flush delay (ms) — keep at `1` for Lambda |
+| `OTEL_BSP_EXPORT_TIMEOUT` | No | `500` | Span export timeout (ms) |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | No | `500` | OTLP HTTP request timeout (ms) |
 
 ### Advanced Configuration (Optional)
 
@@ -320,17 +354,16 @@ cargo clippy
 ```
 ├── Cargo.toml              # Dependencies and build configuration
 ├── Cargo.lock              # Dependency lockfile
+├── otel-instrument         # Bash bootstrap script (AWS_LAMBDA_EXEC_WRAPPER target)
 ├── src/
 │   ├── main.rs            # Extension entry point and lifecycle
 │   ├── config.rs          # Environment variable handling
-│   ├── extension.rs       # Extensions API client
-│   ├── telemetry.rs       # Telemetry API subscriber (formerly logs.rs)
+│   ├── extension.rs       # Extensions API client + flushing strategies
+│   ├── otlp_receiver.rs   # Embedded OTLP HTTP receiver on localhost:4318
+│   ├── telemetry.rs       # Telemetry API subscriber for logs
 │   └── openobserve.rs     # OpenObserve HTTP client
-├── tests/                  # Test suite
-├── build.sh               # Cross-compilation script
-├── deploy.sh              # Deployment helper script
-├── design.md              # Technical design document
-├── start_specs.md         # Startup specifications
+├── build.sh               # Cross-compilation + layer packaging script
+├── deploy.sh              # AWS Lambda layer deployment script
 └── .gitignore             # Git ignore rules
 ```
 

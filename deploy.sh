@@ -80,35 +80,22 @@ deploy_layer_for_arch() {
     
     echo -e "${YELLOW}🚀 Deploying layer for $arch architecture...${NC}"
     
-    # Compatible runtimes for Lambda
-    local compatible_runtimes=(
-        "python3.9" "python3.10" "python3.11" "python3.12" "python3.13"
-        "nodejs18.x" "nodejs20.x" "nodejs22.x"
-        "java11" "java17" "java21"
-        "dotnet8" "dotnet6"
-        "go1.x"
-        "ruby3.2" "ruby3.3"
-        "provided.al2" "provided.al2023"
-    )
-    
-    # Build the AWS CLI command
-    local aws_command="aws lambda publish-layer-version"
-    aws_command="$aws_command --layer-name $layer_name"
-    aws_command="$aws_command --zip-file fileb://$package_file"
-    aws_command="$aws_command --compatible-architectures $arch"
-    aws_command="$aws_command --description \"$description\""
-    aws_command="$aws_command --region $AWS_REGION"
-    
-    # Add compatible runtimes
-    for runtime in "${compatible_runtimes[@]}"; do
-        aws_command="$aws_command --compatible-runtimes $runtime"
-    done
-    
-    echo -e "${BLUE}📡 Executing: $aws_command${NC}"
-    
     # Execute the deployment
     local result
-    result=$(eval "$aws_command" 2>&1)
+    result=$(aws lambda publish-layer-version \
+        --layer-name "$layer_name" \
+        --zip-file "fileb://$package_file" \
+        --compatible-architectures "$arch" \
+        --description "$description" \
+        --region "$AWS_REGION" \
+        --compatible-runtimes \
+            python3.9 python3.10 python3.11 python3.12 python3.13 \
+            nodejs18.x nodejs20.x nodejs22.x \
+            java11 java17 java21 \
+            dotnet8 \
+            ruby3.3 \
+            provided.al2 provided.al2023 \
+        2>&1)
     local exit_code=$?
     
     if [ $exit_code -eq 0 ]; then

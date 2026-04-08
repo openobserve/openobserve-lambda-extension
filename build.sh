@@ -177,19 +177,45 @@ build_extensions() {
 create_layer_structure_for_target() {
     local target=$1
     local arch_name=$2
-    local package_dir="$BUILD_DIR/$arch_name/extensions"
-    
+    local base_dir="$BUILD_DIR/$arch_name"
+    local package_dir="$base_dir/extensions"
+
     echo -e "${YELLOW}📁 Creating Lambda layer structure for $arch_name...${NC}"
-    
-    # Create directories
+
+    # /opt/extensions/ — Rust sidecar binary
     mkdir -p "$package_dir"
-    
-    # Copy the binary to the extensions directory
     cp "target/$target/release/$EXTENSION_NAME" "$package_dir/"
-    
-    # Make sure the binary is executable
     chmod +x "$package_dir/$EXTENSION_NAME"
-    
+
+    # /opt/otel-instrument — Node.js bootstrap script (AWS_LAMBDA_EXEC_WRAPPER target)
+    cp otel-instrument "$base_dir/otel-instrument"
+    chmod +x "$base_dir/otel-instrument"
+
+    # /opt/nodejs/node_modules/ — OTel auto-instrumentation packages
+    # Install them fresh into the layer structure
+    local nodejs_dir="$base_dir/nodejs"
+    mkdir -p "$nodejs_dir"
+
+    echo -e "${BLUE}  📦 Installing OTel node_modules for layer...${NC}"
+    cat > "$nodejs_dir/package.json" <<'EOF'
+{
+  "name": "o2-otel-layer",
+  "version": "1.0.0",
+  "dependencies": {
+    "@opentelemetry/auto-instrumentations-node": "^0.57.0",
+    "@opentelemetry/api": "^1.9.0"
+  }
+}
+EOF
+
+    # Install into the nodejs dir (becomes /opt/nodejs/node_modules in Lambda)
+    if command -v npm &> /dev/null; then
+        (cd "$nodejs_dir" && npm install --omit=dev --no-package-lock 2>&1 | tail -3)
+    else
+        echo -e "${RED}❌ npm not found — skipping node_modules install${NC}"
+        echo -e "${YELLOW}Run: cd $nodejs_dir && npm install --omit=dev${NC}"
+    fi
+
     echo -e "${GREEN}✅ Layer structure created for $arch_name${NC}"
 }
 
@@ -224,7 +250,7 @@ create_package_for_target() {
     echo -e "${YELLOW}📦 Creating deployment package for $arch_name...${NC}"
     
     cd "$BUILD_DIR/$arch_name"
-    zip -r "../../$package_name" extensions/
+    zip -r "../../$package_name" extensions/ otel-instrument nodejs/
     cd - > /dev/null
     
     PACKAGE_SIZE=$(du -h "target/$package_name" | cut -f1)
