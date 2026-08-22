@@ -1,298 +1,321 @@
 #!/bin/bash
 
-set -e
+set -eo pipefail
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # Configuration
 LAYER_NAME_PREFIX="openobserve-extension"
 ARCHITECTURES=("x86_64" "arm64")
+RUNTIMES=("node" "python" "java" "core")
 
-# Default deployment settings
+# Runtime → compatible AWS Lambda runtime identifiers.
+# Keep in sync with what each variant's bundled SDK actually supports.
+compat_runtimes_for() {
+    case "$1" in
+        node)   echo "nodejs18.x nodejs20.x nodejs22.x" ;;
+        python) echo "python3.9 python3.10 python3.11 python3.12 python3.13" ;;
+        java)   echo "java11 java17 java21" ;;
+        # core has no bundled SDK — declare compatibility with everything so
+        # Go/Ruby/.NET/provided.al2* users can attach it.
+        core)   echo "python3.9 python3.10 python3.11 python3.12 python3.13 nodejs18.x nodejs20.x nodejs22.x java11 java17 java21 dotnet8 ruby3.3 provided.al2 provided.al2023" ;;
+        *)      echo "" ;;
+    esac
+}
+
+# Defaults (env-overridable)
 DEPLOY_ARCH="${DEPLOY_ARCH:-all}"
+DEPLOY_RUNTIMES="${DEPLOY_RUNTIMES:-all}"
+DEPLOY_LEGACY_ALIAS="${DEPLOY_LEGACY_ALIAS:-1}"   # also publish the old openobserve-extension-<arch> name
 AWS_REGION="${AWS_REGION:-us-east-1}"
-LAYER_DESCRIPTION="OpenObserve lambda layer extension for forwarding logs"
 
-echo -e "${BLUE}🚀 OpenObserve Lambda Layer Deployment Script${NC}"
-echo -e "${BLUE}=============================================${NC}"
+echo -e "${BLUE}🚀 OpenObserve Lambda Layer Deployment${NC}"
+echo -e "${BLUE}Region: $AWS_REGION   Archs: $DEPLOY_ARCH   Runtimes: $DEPLOY_RUNTIMES${NC}"
 
-# Check if AWS CLI is installed and configured
-check_aws_cli() {
-    echo -e "${YELLOW}🔍 Checking AWS CLI...${NC}"
-    
-    if ! command -v aws &> /dev/null; then
-        echo -e "${RED}❌ Error: AWS CLI is not installed${NC}"
-        echo -e "${YELLOW}Please install AWS CLI: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html${NC}"
-        exit 1
-    fi
-    
-    # Check if AWS credentials are configured
-    if ! aws sts get-caller-identity &> /dev/null; then
-        echo -e "${RED}❌ Error: AWS credentials not configured${NC}"
-        echo -e "${YELLOW}Please configure AWS CLI: aws configure${NC}"
-        exit 1
-    fi
-    
-    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-    echo -e "${GREEN}✅ AWS CLI configured (Account: $ACCOUNT_ID, Region: $AWS_REGION)${NC}"
-}
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 
-# Check if deployment packages exist
-check_packages() {
-    echo -e "${YELLOW}📦 Checking deployment packages...${NC}"
-    
+selected_archs() {
     if [ "$DEPLOY_ARCH" = "all" ]; then
-        for arch in "${ARCHITECTURES[@]}"; do
-            package_file="target/o2-lambda-extension-$arch.zip"
-            if [ ! -f "$package_file" ]; then
-                echo -e "${RED}❌ Error: Package not found: $package_file${NC}"
-                echo -e "${YELLOW}Run './build.sh' to build the packages first${NC}"
-                exit 1
-            fi
-            
-            package_size=$(du -h "$package_file" | cut -f1)
-            echo -e "${GREEN}✅ Found: $package_file ($package_size)${NC}"
-        done
+        printf '%s\n' "${ARCHITECTURES[@]}"
     else
-        package_file="target/o2-lambda-extension-$DEPLOY_ARCH.zip"
-        if [ ! -f "$package_file" ]; then
-            echo -e "${RED}❌ Error: Package not found: $package_file${NC}"
-            echo -e "${YELLOW}Run 'BUILD_TARGETS=<target> ./build.sh' to build the package first${NC}"
-            exit 1
-        fi
-        
-        package_size=$(du -h "$package_file" | cut -f1)
-        echo -e "${GREEN}✅ Found: $package_file ($package_size)${NC}"
+        IFS=',' read -ra requested <<< "$DEPLOY_ARCH"
+        for r in "${requested[@]}"; do
+            r=$(echo "$r" | tr -d '[:space:]')
+            for a in "${ARCHITECTURES[@]}"; do [ "$r" = "$a" ] && echo "$a"; done
+        done
     fi
 }
 
-# Deploy layer for a specific architecture
-deploy_layer_for_arch() {
-    local arch=$1
-    local layer_name="$LAYER_NAME_PREFIX-$arch"
-    local package_file="target/o2-lambda-extension-$arch.zip"
-    local description="$LAYER_DESCRIPTION ($arch)"
-    
-    echo -e "${YELLOW}🚀 Deploying layer for $arch architecture...${NC}"
-    
-    # Execute the deployment
+selected_runtimes() {
+    if [ "$DEPLOY_RUNTIMES" = "all" ]; then
+        printf '%s\n' "${RUNTIMES[@]}"
+    else
+        IFS=',' read -ra requested <<< "$DEPLOY_RUNTIMES"
+        for r in "${requested[@]}"; do
+            r=$(echo "$r" | tr -d '[:space:]')
+            for v in "${RUNTIMES[@]}"; do [ "$r" = "$v" ] && echo "$r"; done
+        done
+    fi
+}
+
+check_aws_cli() {
+    if ! command -v aws &> /dev/null; then
+        echo -e "${RED}❌ AWS CLI is not installed${NC}" >&2
+        exit 1
+    fi
+    if ! aws sts get-caller-identity &> /dev/null; then
+        echo -e "${RED}❌ AWS credentials not configured${NC}" >&2
+        exit 1
+    fi
+    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    echo -e "${GREEN}✅ AWS ready (account $ACCOUNT_ID, region $AWS_REGION)${NC}"
+}
+
+# -----------------------------------------------------------------------------
+# Publish
+# -----------------------------------------------------------------------------
+
+publish_variant() {
+    local runtime=$1
+    local arch=$2
+    local pkg="target/o2-lambda-extension-$runtime-$arch.zip"
+    local layer_name="$LAYER_NAME_PREFIX-$runtime-$arch"
+    local compat_runtimes
+    compat_runtimes=$(compat_runtimes_for "$runtime")
+
+    if [ ! -f "$pkg" ]; then
+        echo -e "${YELLOW}  ⚠ $pkg missing — run ./build.sh first (or skip via DEPLOY_RUNTIMES=)${NC}"
+        return 1
+    fi
+    local sz; sz=$(du -h "$pkg" | cut -f1)
+    echo -e "${YELLOW}📤 publish $layer_name ($sz) → $AWS_REGION${NC}"
+
+    # shellcheck disable=SC2086
     local result
     result=$(aws lambda publish-layer-version \
-        --layer-name "$layer_name" \
-        --zip-file "fileb://$package_file" \
-        --compatible-architectures "$arch" \
-        --description "$description" \
         --region "$AWS_REGION" \
+        --layer-name "$layer_name" \
+        --zip-file "fileb://$pkg" \
+        --compatible-architectures "$arch" \
+        --compatible-runtimes $compat_runtimes \
+        --description "OpenObserve Lambda extension ($runtime, $arch)" \
+        --query 'LayerVersionArn' \
+        --output text 2>&1)
+    local exit_code=$?
+
+    if [ $exit_code -ne 0 ]; then
+        echo -e "${RED}  ✗ publish failed: $result${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}  ✅ $result${NC}"
+    printf '%s\n' "$result" >> "deployment-info-$runtime-$arch.txt"
+}
+
+publish_legacy_alias() {
+    # Backward-compat: publish the pre-variant name (openobserve-extension-<arch>)
+    # as an alias for the node variant. Existing customers referencing the old
+    # ARN name don't have to change anything.
+    local arch=$1
+    local pkg="target/o2-lambda-extension-$arch.zip"
+    if [ ! -f "$pkg" ]; then
+        return 0  # no alias built by build.sh — skip silently
+    fi
+    local layer_name="$LAYER_NAME_PREFIX-$arch"
+    local sz; sz=$(du -h "$pkg" | cut -f1)
+    echo -e "${YELLOW}📤 publish legacy alias $layer_name ($sz) → $AWS_REGION${NC}"
+    local result
+    result=$(aws lambda publish-layer-version \
+        --region "$AWS_REGION" \
+        --layer-name "$layer_name" \
+        --zip-file "fileb://$pkg" \
+        --compatible-architectures "$arch" \
         --compatible-runtimes \
             python3.9 python3.10 python3.11 python3.12 python3.13 \
             nodejs18.x nodejs20.x nodejs22.x \
             java11 java17 java21 \
-            dotnet8 \
-            ruby3.3 \
+            dotnet8 ruby3.3 \
             provided.al2 provided.al2023 \
-        2>&1)
-    local exit_code=$?
-    
-    if [ $exit_code -eq 0 ]; then
-        # Parse the result to get layer ARN and version
-        local layer_arn=$(echo "$result" | grep -o '"LayerArn": "[^"]*"' | cut -d'"' -f4)
-        local version=$(echo "$result" | grep -o '"Version": [0-9]*' | cut -d' ' -f2)
-        
-        echo -e "${GREEN}✅ Layer deployed successfully!${NC}"
-        echo -e "${BLUE}   Layer Name: $layer_name${NC}"
-        echo -e "${BLUE}   Version: $version${NC}"
-        echo -e "${BLUE}   ARN: $layer_arn${NC}"
-        echo -e "${BLUE}   Region: $AWS_REGION${NC}"
-        echo -e "${BLUE}   Architecture: $arch${NC}"
-        echo ""
-        
-        # Save deployment info
-        echo "$layer_arn:$version" >> "deployment-info-$arch.txt"
-        
-        return 0
+        --description "OpenObserve Lambda extension ($arch, node bundle) — legacy alias" \
+        --query 'LayerVersionArn' \
+        --output text 2>&1)
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}  ✅ $result${NC}"
+        printf '%s\n' "$result" >> "deployment-info-$arch.txt"
     else
-        echo -e "${RED}❌ Deployment failed for $arch:${NC}"
-        echo -e "${RED}$result${NC}"
-        return 1
+        echo -e "${RED}  ✗ alias publish failed: $result${NC}"
     fi
 }
 
-# Deploy layers for all specified architectures
-deploy_layers() {
-    echo -e "${YELLOW}🚀 Starting layer deployment...${NC}"
-    
-    local success_count=0
-    local total_count=0
-    local deployed_layers=()
-    
-    if [ "$DEPLOY_ARCH" = "all" ]; then
-        total_count=${#ARCHITECTURES[@]}
-        for arch in "${ARCHITECTURES[@]}"; do
-            if deploy_layer_for_arch "$arch"; then
-                success_count=$((success_count + 1))
-                deployed_layers+=("$arch")
-            fi
+deploy() {
+    check_aws_cli
+
+    local ok=0 total=0
+    for arch in $(selected_archs); do
+        for runtime in $(selected_runtimes); do
+            total=$((total+1))
+            publish_variant "$runtime" "$arch" && ok=$((ok+1)) || true
         done
-    else
-        total_count=1
-        if deploy_layer_for_arch "$DEPLOY_ARCH"; then
-            success_count=1
-            deployed_layers+=("$DEPLOY_ARCH")
+        if [ "$DEPLOY_LEGACY_ALIAS" = "1" ]; then
+            publish_legacy_alias "$arch"
         fi
-    fi
-    
-    # Summary
-    echo -e "${BLUE}📊 Deployment Summary:${NC}"
-    echo -e "${GREEN}✅ Successfully deployed: $success_count/$total_count layers${NC}"
-    
-    if [ ${#deployed_layers[@]} -gt 0 ]; then
-        echo -e "${BLUE}🎯 Deployed layers:${NC}"
-        for arch in "${deployed_layers[@]}"; do
-            echo -e "   • $LAYER_NAME_PREFIX-$arch (architecture: $arch)"
-        done
-        
-        echo -e "\n${YELLOW}📚 Usage Instructions:${NC}"
-        echo -e "1. In your Lambda function configuration:"
-        echo -e "   • Go to 'Layers' section"
-        echo -e "   • Click 'Add a layer'"
-        echo -e "   • Select 'Custom layers'"
-        echo -e "   • Choose the layer matching your function's architecture"
-        echo -e ""
-        echo -e "2. Set environment variables in your Lambda function:"
-        echo -e "   • O2_ORGANIZATION_ID=your_organization_id"
-        echo -e "   • O2_AUTHORIZATION_HEADER=\"Basic your_base64_encoded_credentials\""
-        echo -e "   • O2_ENDPOINT=https://api.openobserve.ai (optional)"
-        echo -e "   • O2_STREAM=default (optional)"
-        echo -e ""
-        echo -e "3. The extension will automatically start capturing and forwarding logs"
-    fi
-    
-    if [ $success_count -lt $total_count ]; then
-        echo -e "${RED}⚠️  Some deployments failed. Check the error messages above.${NC}"
+    done
+
+    echo ""
+    echo -e "${BLUE}📊 Summary: $ok/$total variants published${NC}"
+
+    cat <<'EOM'
+
+📚 Attach the right variant on each Lambda function:
+   Node.js runtimes            → openobserve-extension-node-<arch>
+   Python runtimes             → openobserve-extension-python-<arch>
+   Java runtimes               → openobserve-extension-java-<arch>
+   Go / Ruby / .NET / custom   → openobserve-extension-core-<arch>
+
+📌 Required function env vars:
+   AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument
+   O2_ORGANIZATION_ID=<your-org>
+   O2_AUTHORIZATION_HEADER="Basic <base64(user:pass)>"
+
+📌 Common optional:
+   O2_ENDPOINT=https://api.openobserve.ai
+   O2_STREAM=lambda_logs
+   O2_SERVICE=<service.name>
+   O2_ENV=<deployment.environment>
+   O2_EMIT_BASE_ALIASES=true    # also emit aws.lambda.{duration,errors,invocations}
+EOM
+
+    if [ $ok -lt $total ]; then
+        echo -e "${RED}⚠  Some publishes failed — see logs above${NC}"
         exit 1
     fi
 }
 
-# List existing layers
+# -----------------------------------------------------------------------------
+# List
+# -----------------------------------------------------------------------------
+
 list_layers() {
-    echo -e "${YELLOW}📋 Listing existing OpenObserve layers...${NC}"
-    
-    for arch in "${ARCHITECTURES[@]}"; do
-        local layer_name="$LAYER_NAME_PREFIX-$arch"
-        echo -e "${BLUE}Checking layer: $layer_name${NC}"
-        
-        local result
-        result=$(aws lambda list-layer-versions --layer-name "$layer_name" --region "$AWS_REGION" 2>/dev/null || echo "No layers found")
-        
-        if [[ "$result" == "No layers found" ]] || [[ "$result" == *"ResourceNotFoundException"* ]]; then
-            echo -e "${YELLOW}   No versions found for $layer_name${NC}"
-        else
-            local versions=$(echo "$result" | grep -o '"Version": [0-9]*' | cut -d' ' -f2 | head -5)
-            echo -e "${GREEN}   Latest versions: $(echo $versions | tr '\n' ' ')${NC}"
+    check_aws_cli
+    echo -e "${YELLOW}📋 layers in $AWS_REGION starting with '$LAYER_NAME_PREFIX-'${NC}"
+    for arch in $(selected_archs); do
+        for runtime in $(selected_runtimes); do
+            local ln="$LAYER_NAME_PREFIX-$runtime-$arch"
+            local versions
+            versions=$(aws lambda list-layer-versions --region "$AWS_REGION" \
+                --layer-name "$ln" --query 'LayerVersions[].Version' --output text 2>/dev/null || echo "")
+            if [ -z "$versions" ] || [ "$versions" = "None" ]; then
+                echo -e "  · $ln  ${YELLOW}(none)${NC}"
+            else
+                echo -e "  · $ln  ${GREEN}versions: $versions${NC}"
+            fi
+        done
+        # legacy alias
+        local ln="$LAYER_NAME_PREFIX-$arch"
+        local versions
+        versions=$(aws lambda list-layer-versions --region "$AWS_REGION" \
+            --layer-name "$ln" --query 'LayerVersions[].Version' --output text 2>/dev/null || echo "")
+        if [ -n "$versions" ] && [ "$versions" != "None" ]; then
+            echo -e "  · $ln (legacy alias)  ${GREEN}versions: $versions${NC}"
         fi
-        echo ""
     done
 }
 
-# Delete layers
+# -----------------------------------------------------------------------------
+# Delete
+# -----------------------------------------------------------------------------
+
 delete_layers() {
-    echo -e "${YELLOW}🗑️  Deleting OpenObserve layers...${NC}"
-    echo -e "${RED}⚠️  This will delete ALL versions of the layers!${NC}"
-    read -p "Are you sure? (y/N): " -n 1 -r
-    echo
-    
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}Deletion cancelled.${NC}"
+    check_aws_cli
+    echo -e "${RED}⚠  This will delete ALL versions of the selected layers in $AWS_REGION${NC}"
+    read -rp "Type 'DELETE' to confirm: " confirm
+    if [ "$confirm" != "DELETE" ]; then
+        echo -e "${YELLOW}cancelled${NC}"
         exit 0
     fi
-    
-    for arch in "${ARCHITECTURES[@]}"; do
-        local layer_name="$LAYER_NAME_PREFIX-$arch"
-        echo -e "${YELLOW}Deleting layer: $layer_name${NC}"
-        
-        # Get all versions
+
+    delete_one() {
+        local ln=$1
         local versions
-        versions=$(aws lambda list-layer-versions --layer-name "$layer_name" --region "$AWS_REGION" 2>/dev/null | grep -o '"Version": [0-9]*' | cut -d' ' -f2 || true)
-        
-        if [ -z "$versions" ]; then
-            echo -e "${YELLOW}   No versions found for $layer_name${NC}"
-            continue
+        versions=$(aws lambda list-layer-versions --region "$AWS_REGION" \
+            --layer-name "$ln" --query 'LayerVersions[].Version' --output text 2>/dev/null || true)
+        if [ -z "$versions" ] || [ "$versions" = "None" ]; then
+            return 0
         fi
-        
-        # Delete each version
-        for version in $versions; do
-            echo -e "${YELLOW}   Deleting version $version...${NC}"
-            aws lambda delete-layer-version --layer-name "$layer_name" --version-number "$version" --region "$AWS_REGION" > /dev/null
-            echo -e "${GREEN}   ✅ Deleted version $version${NC}"
+        for v in $versions; do
+            echo -e "  ✗ $ln:$v"
+            aws lambda delete-layer-version --region "$AWS_REGION" \
+                --layer-name "$ln" --version-number "$v" >/dev/null
         done
+    }
+
+    for arch in $(selected_archs); do
+        for runtime in $(selected_runtimes); do
+            delete_one "$LAYER_NAME_PREFIX-$runtime-$arch"
+        done
+        delete_one "$LAYER_NAME_PREFIX-$arch"
     done
-    
-    echo -e "${GREEN}✅ All layers deleted successfully${NC}"
+    echo -e "${GREEN}✅ done${NC}"
 }
 
-# Show help
+# -----------------------------------------------------------------------------
+# Help
+# -----------------------------------------------------------------------------
+
 show_help() {
-    echo -e "${BLUE}OpenObserve Lambda Layer Deployment Script${NC}"
-    echo ""
-    echo "Usage: $0 [command] [options]"
-    echo ""
-    echo "Commands:"
-    echo "  deploy     Deploy layer(s) to AWS Lambda (default)"
-    echo "  list       List existing layer versions"
-    echo "  delete     Delete all layer versions"
-    echo "  help       Show this help message"
-    echo ""
-    echo "Environment Variables:"
-    echo "  DEPLOY_ARCH      Architecture to deploy:"
-    echo "                   'all' - Deploy both architectures (default)"
-    echo "                   'x86_64' - Deploy x86_64 only"
-    echo "                   'arm64' - Deploy arm64 only"
-    echo ""
-    echo "  AWS_REGION       AWS region (default: us-east-1)"
-    echo ""
-    echo "Examples:"
-    echo "  $0                                    # Deploy both architectures"
-    echo "  DEPLOY_ARCH=x86_64 $0                # Deploy x86_64 only"
-    echo "  DEPLOY_ARCH=arm64 AWS_REGION=eu-west-1 $0  # Deploy arm64 to EU"
-    echo "  $0 list                               # List existing layers"
-    echo "  $0 delete                             # Delete all layers"
+    cat <<EOF
+${BLUE}OpenObserve Lambda Layer Deployment${NC}
+
+Usage: $0 [command]
+
+Commands:
+  deploy   Publish new layer version(s) (default)
+  list     List existing layer versions
+  delete   Delete all layer versions (requires typing 'DELETE')
+  help     Show this help
+
+Environment variables:
+  AWS_REGION           default: us-east-1
+  DEPLOY_ARCH          'all' (default) or comma-separated: x86_64,arm64
+  DEPLOY_RUNTIMES      'all' (default) or comma-separated: node,python,java,core
+  DEPLOY_LEGACY_ALIAS  '1' (default) publishes openobserve-extension-<arch>
+                       as an alias pointing at the node bundle for backward
+                       compatibility with pre-per-runtime deployments.
+                       Set to '0' to skip.
+
+Layer name pattern:
+  ${LAYER_NAME_PREFIX}-<runtime>-<arch>
+    e.g. ${LAYER_NAME_PREFIX}-node-arm64, ${LAYER_NAME_PREFIX}-python-x86_64
+
+  Legacy alias (when DEPLOY_LEGACY_ALIAS=1 and target/o2-lambda-extension-<arch>.zip exists):
+  ${LAYER_NAME_PREFIX}-<arch>     (points to the node bundle)
+
+Examples:
+  $0                                            # publish everything present in target/
+  DEPLOY_ARCH=arm64 DEPLOY_RUNTIMES=node $0     # only node-arm64
+  DEPLOY_LEGACY_ALIAS=0 DEPLOY_RUNTIMES=node,python $0
+  AWS_REGION=eu-west-1 $0 list
+EOF
 }
 
-# Main execution flow
-main() {
-    check_aws_cli
-    check_packages
-    deploy_layers
-    
-    echo -e "\n${GREEN}🎉 Deployment completed successfully!${NC}"
-    echo -e "${BLUE}Region: $AWS_REGION${NC}"
-    echo -e "${BLUE}Account: $ACCOUNT_ID${NC}"
-}
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
 
-# Handle script arguments
 case "${1:-deploy}" in
-    "deploy")
-        main
-        ;;
-    "list")
-        check_aws_cli
-        list_layers
-        ;;
-    "delete")
-        check_aws_cli
-        delete_layers
-        ;;
-    "help"|"-h"|"--help")
-        show_help
-        ;;
+    deploy)         deploy ;;
+    list)           list_layers ;;
+    delete)         delete_layers ;;
+    help|-h|--help) show_help ;;
     *)
-        echo -e "${RED}❌ Unknown command: $1${NC}"
-        echo "Use '$0 help' for usage information"
+        echo -e "${RED}Unknown command: $1${NC}"
+        show_help
         exit 1
         ;;
 esac

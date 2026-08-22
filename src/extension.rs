@@ -10,7 +10,7 @@ use tokio::time::timeout;
 
 use crate::telemetry::TelemetryAggregator;
 use crate::config::Config;
-use crate::otlp_receiver::{SpanBuffer, flush_spans};
+use crate::otlp_receiver::{SpanBuffer, MetricBuffer, flush_spans, flush_metrics};
 
 const LAMBDA_EXTENSION_IDENTIFIER_HEADER: &str = "Lambda-Extension-Identifier";
 const LAMBDA_EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
@@ -70,6 +70,7 @@ pub struct ExtensionClient {
     aggregator: Option<Arc<Mutex<TelemetryAggregator>>>,
     config: Option<Arc<Config>>,
     span_buffer: Option<SpanBuffer>,
+    metric_buffer: Option<MetricBuffer>,
     pub current_strategy: FlushingStrategy,
     last_periodic_flush: Instant,
     continuous_flush_task: Option<tokio::task::JoinHandle<()>>,
@@ -92,6 +93,7 @@ impl ExtensionClient {
             aggregator: None,
             config: None,
             span_buffer: None,
+            metric_buffer: None,
             current_strategy: FlushingStrategy::EndOfInvocation, // Start with safe default
             last_periodic_flush: now,
             continuous_flush_task: None,
@@ -103,10 +105,12 @@ impl ExtensionClient {
         aggregator: Arc<Mutex<TelemetryAggregator>>,
         config: Arc<Config>,
         span_buffer: SpanBuffer,
+        metric_buffer: MetricBuffer,
     ) {
         self.aggregator = Some(aggregator);
         self.config = Some(config);
         self.span_buffer = Some(span_buffer);
+        self.metric_buffer = Some(metric_buffer);
     }
 
     /// Determine the appropriate flushing strategy based on invocation patterns
@@ -178,20 +182,30 @@ impl ExtensionClient {
         if let (Some(aggregator), Some(config)) = (self.aggregator.clone(), self.config.clone()) {
             let aggregator_clone = Arc::clone(&aggregator);
             let config_clone = Arc::clone(&config);
-            
+            let span_buffer_clone = self.span_buffer.clone();
+            let metric_buffer_clone = self.metric_buffer.clone();
+
             let task = tokio::spawn(async move {
                 debug!("🚀 Started continuous flush task");
                 let mut interval = tokio::time::interval(Duration::from_secs(PERIODIC_FLUSH_INTERVAL_SECS));
-                
+
                 loop {
                     interval.tick().await;
-                    
-                    // Try to flush with a short timeout to avoid blocking
+
+                    // Wrap logs + spans + metrics flushes together. On a cold TLS
+                    // handshake each POST can take ~200–400 ms; sequential across
+                    // three signals easily exceeds 500 ms. 3 s gives headroom
+                    // without letting a hung endpoint stall the flush task.
                     let flush_result = timeout(
-                        Duration::from_millis(500), // 500ms timeout for async flush
-                        Self::flush_telemetry_async(&aggregator_clone, &config_clone)
+                        Duration::from_millis(3000),
+                        Self::flush_telemetry_async(
+                            &aggregator_clone,
+                            &config_clone,
+                            span_buffer_clone.as_ref(),
+                            metric_buffer_clone.as_ref(),
+                        )
                     ).await;
-                    
+
                     match flush_result {
                         Ok(Ok(events_sent)) if events_sent > 0 => {
                             debug!("📤 Continuous flush: {} events sent", events_sent);
@@ -206,11 +220,11 @@ impl ExtensionClient {
                     }
                 }
             });
-            
+
             self.continuous_flush_task = Some(task);
             info!("✅ Continuous flush task started");
         }
-        
+
         Ok(())
     }
 
@@ -245,22 +259,47 @@ impl ExtensionClient {
     async fn flush_telemetry_async(
         aggregator: &Arc<Mutex<TelemetryAggregator>>,
         config: &Arc<Config>,
+        span_buffer: Option<&SpanBuffer>,
+        metric_buffer: Option<&MetricBuffer>,
     ) -> Result<u64> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(config.request_timeout_ms))
+            .build()
+            .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
+
+        let mut total: u64 = 0;
+
         let batch = {
             let mut guard = aggregator.lock().await;
             guard.get_batch()
         };
-        if batch.is_empty() { return Ok(0); }
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(1000))
-            .build()
-            .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
-
-        match crate::openobserve::send_batch_to_openobserve(&client, config, &batch).await {
-            Ok(n) => { debug!("✅ Async flush: {} events", n); Ok(n) }
-            Err(e) => { warn!("❌ Async flush failed: {}", e); Err(e) }
+        // A log failure MUST NOT block span/metric flushing.
+        let mut log_err: Option<anyhow::Error> = None;
+        if !batch.is_empty() {
+            match crate::openobserve::send_batch_to_openobserve(&client, config, &batch).await {
+                Ok(n) => { total += n; debug!("✅ Async log flush: {} events", n); }
+                Err(e) => { warn!("❌ Async log flush failed: {}", e); log_err = Some(e); }
+            }
         }
+        // Silence unused warning if neither span nor metric buffer present
+        let _ = &log_err;
+
+        if let Some(span_buf) = span_buffer {
+            match flush_spans(&client, config, span_buf).await {
+                Ok(n) => { total += n; if n > 0 { debug!("🔍 Async span flush: {} batches", n); } }
+                Err(e) => warn!("⚠️ Async span flush failed: {}", e),
+            }
+        }
+
+        if let Some(metric_buf) = metric_buffer {
+            match flush_metrics(&client, config, metric_buf).await {
+                Ok(n) => { total += n; if n > 0 { debug!("📊 Async metric flush: {} batches", n); } }
+                Err(e) => warn!("⚠️ Async metric flush failed: {}", e),
+            }
+        }
+
+        if let Some(e) = log_err { return Err(e); }
+        Ok(total)
     }
     
     pub async fn register(&mut self) -> Result<RegisterResponse> {
@@ -392,11 +431,14 @@ impl ExtensionClient {
         let mut total_events = 0;
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(1900))
+            .timeout(std::time::Duration::from_millis(config.request_timeout_ms))
             .build()
             .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
 
-        // Flush logs
+        // Flush logs — a log-send failure MUST NOT abort span/metric flushing below.
+        // Break out on the first error so we don't retry the same failing batch in
+        // a hot loop, then continue to spans/metrics.
+        let mut log_err: Option<anyhow::Error> = None;
         loop {
             let batch = {
                 let mut guard = aggregator.lock().await;
@@ -405,7 +447,7 @@ impl ExtensionClient {
             if batch.is_empty() { break; }
             match crate::openobserve::send_batch_to_openobserve(&client, config, &batch).await {
                 Ok(n) => total_events += n,
-                Err(e) => { debug!("❌ Log batch failed: {}", e); return Err(e); }
+                Err(e) => { debug!("❌ Log batch failed: {}", e); log_err = Some(e); break; }
             }
         }
 
@@ -417,7 +459,19 @@ impl ExtensionClient {
             }
         }
 
+        // Flush metrics (if OTLP receiver is enabled)
+        if let Some(metric_buf) = &self.metric_buffer {
+            match flush_metrics(&client, config, metric_buf).await {
+                Ok(n) => { total_events += n; debug!("📊 Flushed {} metric batches", n); }
+                Err(e) => debug!("⚠️ Metric flush failed: {}", e),
+            }
+        }
+
         debug!("🎉 Flush completed: {} total events sent", total_events);
+        // If logs failed but spans/metrics succeeded, surface the log error at the
+        // top for retry-strategy logic in the caller; total_events still reflects
+        // what did make it out.
+        if let Some(e) = log_err { return Err(e); }
         Ok(total_events)
     }
     

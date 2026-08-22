@@ -11,6 +11,8 @@ mod extension;
 mod otlp_receiver;
 mod telemetry;
 mod openobserve;
+mod enhanced_metrics;
+mod compress;
 
 use config::Config;
 use extension::{ExtensionClient, NextEventResponse, FlushingStrategy};
@@ -129,20 +131,27 @@ async fn run_extension(config: Arc<Config>, metrics: &mut ExtensionMetrics) -> R
         )
     ));
 
-    // Start telemetry subscriber (logs via Lambda Telemetry API)
-    let mut telemetry_subscriber = TelemetrySubscriber::new(TELEMETRY_SUBSCRIBER_PORT, Arc::clone(&aggregator));
+    // Start OTLP receiver (traces + metrics from OTel SDK via AWS_LAMBDA_EXEC_WRAPPER)
+    // Created first so the telemetry subscriber can push enhanced metrics
+    // (synthesized from platform.report) into the same buffer.
+    let (mut otlp_receiver, span_buffer, metric_buffer) = OtlpReceiver::new(OTLP_RECEIVER_PORT);
+    otlp_receiver.start().await?;
+
+    // Start telemetry subscriber (logs + platform events via Lambda Telemetry API)
+    let mut telemetry_subscriber = TelemetrySubscriber::new(
+        TELEMETRY_SUBSCRIBER_PORT,
+        Arc::clone(&aggregator),
+        Arc::clone(&metric_buffer),
+    );
     telemetry_subscriber.start().await?;
     telemetry_subscriber.subscribe_to_telemetry_api(&extension_id).await?;
-
-    // Start OTLP receiver (traces from OTel SDK via AWS_LAMBDA_EXEC_WRAPPER)
-    let (mut otlp_receiver, span_buffer) = OtlpReceiver::new(OTLP_RECEIVER_PORT);
-    otlp_receiver.start().await?;
 
     // Set telemetry components in extension client for flush + SHUTDOWN handling
     extension_client.set_telemetry_components(
         Arc::clone(&aggregator),
         Arc::clone(&config),
         span_buffer,
+        metric_buffer,
     );
 
     // Main extension lifecycle loop - SHUTDOWN flush now happens in extension.rs
