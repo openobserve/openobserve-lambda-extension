@@ -10,6 +10,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::error;
 
+use crate::enhanced_metrics::maybe_emit_enhanced_metrics;
+use crate::otlp_receiver::MetricBuffer;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryEvent {
     pub time: DateTime<Utc>,
@@ -102,27 +105,35 @@ impl TelemetryAggregator {
 pub struct TelemetrySubscriber {
     port: u16,
     aggregator: Arc<Mutex<TelemetryAggregator>>,
+    metric_buffer: MetricBuffer,
     server_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl TelemetrySubscriber {
-    pub fn new(port: u16, aggregator: Arc<Mutex<TelemetryAggregator>>) -> Self {
+    pub fn new(
+        port: u16,
+        aggregator: Arc<Mutex<TelemetryAggregator>>,
+        metric_buffer: MetricBuffer,
+    ) -> Self {
         Self {
             port,
             aggregator,
+            metric_buffer,
             server_handle: None,
         }
     }
-    
+
     pub async fn start(&mut self) -> Result<()> {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         let aggregator = Arc::clone(&self.aggregator);
-        
+        let metric_buffer = Arc::clone(&self.metric_buffer);
+
         let make_svc = hyper::service::make_service_fn(move |_conn| {
             let aggregator = Arc::clone(&aggregator);
+            let metric_buffer = Arc::clone(&metric_buffer);
             async move {
                 Ok::<_, Infallible>(hyper::service::service_fn(move |req| {
-                    handle_telemetry_request(req, Arc::clone(&aggregator))
+                    handle_telemetry_request(req, Arc::clone(&aggregator), Arc::clone(&metric_buffer))
                 }))
             }
         });
@@ -194,12 +205,13 @@ impl TelemetrySubscriber {
 async fn handle_telemetry_request(
     req: Request<Body>,
     aggregator: Arc<Mutex<TelemetryAggregator>>,
+    metric_buffer: MetricBuffer,
 ) -> Result<Response<Body>, Infallible> {
     // debug!("🔥 TELEMETRY REQUEST RECEIVED! Method: {}, URI: {}", req.method(), req.uri());
-    
+
     match req.method() {
         &hyper::Method::POST => {
-            match process_telemetry_batch(req, aggregator).await {
+            match process_telemetry_batch(req, aggregator, metric_buffer).await {
                 Ok(_) => {
                     let response = Response::builder()
                         .status(StatusCode::OK)
@@ -230,28 +242,34 @@ async fn handle_telemetry_request(
 async fn process_telemetry_batch(
     req: Request<Body>,
     aggregator: Arc<Mutex<TelemetryAggregator>>,
+    metric_buffer: MetricBuffer,
 ) -> Result<()> {
     let body_bytes = body::to_bytes(req.into_body())
         .await
         .map_err(|e| anyhow!("Failed to read request body: {}", e))?;
-    
+
     let body_str = String::from_utf8(body_bytes.to_vec())
         .map_err(|e| anyhow!("Invalid UTF-8 in request body: {}", e))?;
-    
-    
+
     // Parse telemetry events
     let telemetry_events: Vec<TelemetryEvent> = serde_json::from_str(&body_str)
         .map_err(|e| {
             error!("Failed to parse telemetry events: {}", e);
             anyhow!("Failed to parse telemetry events: {}", e)
         })?;
-    
-    // Add events directly to aggregator
+
+    // Synthesize aws.lambda.enhanced.* metrics from any platform.report events.
+    // The raw event still flows through to the log aggregator below unchanged.
+    for event in &telemetry_events {
+        maybe_emit_enhanced_metrics(event, &metric_buffer).await;
+    }
+
+    // Add events directly to aggregator (logs path — unchanged)
     {
         let mut aggregator_guard = aggregator.lock().await;
         aggregator_guard.add_batch(telemetry_events);
     }
-    
+
     Ok(())
 }
 

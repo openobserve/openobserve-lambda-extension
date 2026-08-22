@@ -1,22 +1,66 @@
 #!/bin/bash
 # OpenObserve Lambda OTel bootstrap
 # Used as AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument
+#
+# Detects the Lambda runtime and enables the appropriate OpenTelemetry
+# auto-instrumentation IF the corresponding SDK bundle is present in the
+# layer. The layer variants bundle exactly one runtime's SDK:
+#   /opt/nodejs/node_modules/@opentelemetry/…       (node variant)
+#   /opt/python/opentelemetry/…                     (python variant)
+#   /opt/java/opentelemetry-javaagent.jar           (java variant)
+# The "core" variant bundles none — extension-only, useful for Go/Ruby/.NET
+# users who wire their own SDK.
 
-OTEL_PKG="/opt/nodejs/node_modules/@opentelemetry/auto-instrumentations-node/build/src/register.js"
-
-# Point the OTel SDK at the OTLP receiver inside this extension (localhost:4318)
-# Only sets defaults — existing env vars (e.g. set in Lambda console) take precedence
+# --- shared OTLP wiring (all runtimes) -----------------------------------
 export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}"
-export OTEL_EXPORTER_OTLP_PROTOCOL="${OTEL_EXPORTER_OTLP_PROTOCOL:-http/json}"
+# Prefer protobuf (SDK default) — ~2× smaller than JSON on the wire.
+# The extension's OTLP receiver preserves Content-Type end-to-end.
+export OTEL_EXPORTER_OTLP_PROTOCOL="${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}"
 export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-http://localhost:4318/v1/traces}"
+export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT="${OTEL_EXPORTER_OTLP_METRICS_ENDPOINT:-http://localhost:4318/v1/metrics}"
 export OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-${AWS_LAMBDA_FUNCTION_NAME:-lambda-function}}"
 export OTEL_LOGS_EXPORTER="${OTEL_LOGS_EXPORTER:-none}"
-export OTEL_METRICS_EXPORTER="${OTEL_METRICS_EXPORTER:-none}"
+export OTEL_METRICS_EXPORTER="${OTEL_METRICS_EXPORTER:-otlp}"
 export OTEL_TRACES_EXPORTER="${OTEL_TRACES_EXPORTER:-otlp}"
+# Flush metrics every second so short-lived invocations don't lose data
+export OTEL_METRIC_EXPORT_INTERVAL="${OTEL_METRIC_EXPORT_INTERVAL:-1000}"
+export OTEL_METRIC_EXPORT_TIMEOUT="${OTEL_METRIC_EXPORT_TIMEOUT:-500}"
+# BatchSpanProcessor schedule delay — SDK default is 5000ms, which is
+# longer than most Lambda invocations. Lambda freezes the sandbox between
+# invocations, so spans buffered in the BSP get dropped. 500ms is short
+# enough to fire during a typical handler execution but long enough to
+# batch multiple spans per POST.
+export OTEL_BSP_SCHEDULE_DELAY="${OTEL_BSP_SCHEDULE_DELAY:-500}"
+export OTEL_BSP_EXPORT_TIMEOUT="${OTEL_BSP_EXPORT_TIMEOUT:-500}"
 
-# Preload auto-instrumentation only if the package is present in the layer
-if [ -f "$OTEL_PKG" ]; then
-    export NODE_OPTIONS="--require $OTEL_PKG${NODE_OPTIONS:+ $NODE_OPTIONS}"
+# --- runtime detection ---------------------------------------------------
+# AWS sets AWS_EXECUTION_ENV to e.g. "AWS_Lambda_nodejs20.x", "AWS_Lambda_python3.12",
+# "AWS_Lambda_java21", "AWS_Lambda_ruby3.3", "AWS_Lambda_dotnet8", "AWS_Lambda_provided.al2023".
+_env="${AWS_EXECUTION_ENV:-unknown}"
+
+# --- Node.js -------------------------------------------------------------
+NODE_OTEL_REG="/opt/nodejs/node_modules/@opentelemetry/auto-instrumentations-node/build/src/register.js"
+if [[ "$_env" == *nodejs* ]] && [ -f "$NODE_OTEL_REG" ]; then
+    export NODE_OPTIONS="--require $NODE_OTEL_REG${NODE_OPTIONS:+ $NODE_OPTIONS}"
+fi
+
+# --- Python --------------------------------------------------------------
+# We bundle opentelemetry-distro under /opt/python and copy its
+# sitecustomize.py to /opt/python/sitecustomize.py so the Python interpreter
+# imports it at startup (Lambda automatically adds /opt/python to sys.path).
+if [[ "$_env" == *python* ]] && [ -f "/opt/python/sitecustomize.py" ]; then
+    export PYTHONPATH="/opt/python:${PYTHONPATH}"
+    export OTEL_PYTHON_DISTRO="${OTEL_PYTHON_DISTRO:-opentelemetry_distro}"
+    export OTEL_PYTHON_CONFIGURATOR="${OTEL_PYTHON_CONFIGURATOR:-default_configurator}"
+fi
+
+# --- Java ----------------------------------------------------------------
+JAVA_AGENT="/opt/java/opentelemetry-javaagent.jar"
+if [[ "$_env" == *java* ]] && [ -f "$JAVA_AGENT" ]; then
+    # -javaagent must be passed via JAVA_TOOL_OPTIONS in Lambda
+    export JAVA_TOOL_OPTIONS="-javaagent:$JAVA_AGENT ${JAVA_TOOL_OPTIONS}"
+    # Match SDK defaults to our OTLP endpoint semantics
+    export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}"
 fi
 
 # Hand off to the real Lambda bootstrap

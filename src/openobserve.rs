@@ -5,6 +5,7 @@ use std::cmp;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, warn};
 
+use crate::compress::gzip;
 use crate::config::Config;
 use crate::telemetry::TelemetryEvent;
 
@@ -33,16 +34,26 @@ pub async fn send_batch_to_openobserve(
     
     let mut current_delay = config.initial_retry_delay_ms;
     let mut last_error = None;
-    
+
+    // Compress once up front — batches are typically 3–10× smaller gzipped.
+    let (body, encoding) = match gzip(json_batch) {
+        Ok(gz) => (gz, Some("gzip")),
+        Err(e) => {
+            warn!("gzip failed, sending uncompressed: {}", e);
+            (json_batch.to_vec(), None)
+        }
+    };
+
     // Attempt initial request + retries
     for attempt in 0..=(config.max_retries) {
-        let response_result = client
+        let mut req = client
             .post(&url)
             .header("Authorization", &config.o2_authorization_header)
-            .header("Content-Type", "application/json")
-            .body(json_batch.to_vec())
-            .send()
-            .await;
+            .header("Content-Type", "application/json");
+        if let Some(enc) = encoding {
+            req = req.header("Content-Encoding", enc);
+        }
+        let response_result = req.body(body.clone()).send().await;
         
         match response_result {
             Ok(response) => {

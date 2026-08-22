@@ -147,6 +147,15 @@ impl Config {
         format!("{}/v1/traces", base)
     }
 
+    /// OTLP metrics endpoint — uses OTEL_EXPORTER_OTLP_ENDPOINT if set,
+    /// otherwise constructs from O2_* vars.
+    pub fn metrics_url(&self) -> String {
+        let base = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .map(|e| e.trim_end_matches('/').to_string())
+            .unwrap_or_else(|_| format!("{}/api/{}", self.o2_endpoint.trim_end_matches('/'), self.o2_organization_id));
+        format!("{}/v1/metrics", base)
+    }
+
     /// Authorization header value — prefers OTEL_EXPORTER_OTLP_HEADERS, falls back to O2_AUTHORIZATION_HEADER.
     pub fn effective_auth_header(&self) -> String {
         if let Ok(headers) = std::env::var("OTEL_EXPORTER_OTLP_HEADERS") {
