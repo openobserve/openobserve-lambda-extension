@@ -158,7 +158,7 @@ Lambda Invocation (Parent Span)
 ```bash
 # Required
 export OTEL_EXPORTER_OTLP_ENDPOINT="https://api.openobserve.ai/api/my_organization_123"
-export OTEL_EXPORTER_OTLP_HEADERS="authorization=Basic cHJhYmhhdEBvcGVub2JzZXJ2ZS5haTp***"
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Basic <base64-credentials>"
 
 # Optional
 export O2_TELEMETRY_TYPES="platform,function,extension"
